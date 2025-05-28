@@ -6,12 +6,17 @@ from diffusers import FluxPipeline
 import numpy as np
 from PIL import Image
 
+def set_gpu_device(gpu_id):
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
 class StableFlow:
     MULTIMODAL_VITAL_LAYERS = [0, 1, 17, 18]
     SINGLE_MODAL_VITAL_LAYERS = list(np.array([28, 53, 54, 56, 25]) - 19) 
 
     def __init__(self):
         self._parse_args()
+        set_gpu_device(self.args.gpu_id)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self._load_pipeline()
 
     def _parse_args(self):
@@ -20,13 +25,17 @@ class StableFlow:
         parser.add_argument("--model_path", type=str, default="black-forest-labs/FLUX.1-dev")
         parser.add_argument("--hf_token", type=str, required=True)
         parser.add_argument("--prompts", type=str, nargs="+", required=True)
-        parser.add_argument("--output_path", type=str, default="outputs/result.jpg")
+        parser.add_argument("--output_path", type=str, default="outputs/result_alpha{attention_alpha}.jpg")
         parser.add_argument("--input_img_path", type=str, default=None)
         parser.add_argument("--seed", type=int, default=42)
         parser.add_argument("--cpu_offload", action="store_true")
-        parser.add_argument("--device", type=str, default="cuda")
+        parser.add_argument("--gpu_id", type=int, default=0,help="0, 1, 2..")
+        parser.add_argument("--attention_alpha", type=float, default=1.0)
 
         self.args = parser.parse_args()
+
+        alpha_str = str(self.args.attention_alpha).replace('.', '_')
+        self.args.output_path = self.args.output_path.format(attention_alpha=alpha_str)
         os.makedirs(os.path.dirname(self.args.output_path), exist_ok=True)
 
     def _load_pipeline(self):
@@ -40,14 +49,15 @@ class StableFlow:
         if self.args.cpu_offload:
             self.pipe.enable_sequential_cpu_offload()
         else:
-            self.pipe.to(self.args.device)
+            self.pipe.to(self.device)
 
     @torch.no_grad()
     def infer_and_save(self, prompts):
+        generator = torch.Generator(device=self.device).manual_seed(self.args.seed)
         latents = torch.randn(
             (4096, 64), 
-            generator=torch.Generator(0).manual_seed(self.args.seed), 
-            device=self.args.device, 
+            generator=generator, 
+            device=self.device, 
             dtype=torch.float16
         ).tile(len(prompts), 1, 1)
         images = self.pipe(
@@ -67,8 +77,8 @@ class StableFlow:
         res.save(self.args.output_path)
 
     @torch.no_grad()
-    def image2latent(self, image, latent_nudging_scalar = 1.15):
-        image = self.pipe.image_processor.preprocess(image).type(self.pipe.vae.dtype).to("cuda")
+    def image2latent(self, image, latent_nudging_scalar=1.15):
+        image = self.pipe.image_processor.preprocess(image).type(self.pipe.vae.dtype).to(self.device)
         latents = self.pipe.vae.encode(image)["latent_dist"].mean
         latents = (latents - self.pipe.vae.config.shift_factor) * self.pipe.vae.config.scaling_factor
         latents = latents * latent_nudging_scalar
@@ -79,14 +89,12 @@ class StableFlow:
             height=128,
             width=128
         )
-
         return latents
-
 
     @torch.no_grad()
     def invert_and_save(self, prompts):
         inversion_prompt = prompts[0:1]
-        # Invert
+        latents_for_inversion = self.image2latent(Image.open(self.args.input_img_path))
         inverted_latent_list = self.pipe(
             inversion_prompt,
             height=1024,
@@ -95,11 +103,25 @@ class StableFlow:
             output_type="pil",
             num_inference_steps=50,
             max_sequence_length=512,
-            latents=self.image2latent(Image.open(self.args.input_img_path)),
+            latents=latents_for_inversion,
             invert_image=True
         )
+        edited_latents = inverted_latent_list[-1].tile(len(prompts), 1, 1)
 
-        # Edit
+        ## Changed
+        generator = torch.Generator(device=edited_latents.device).manual_seed(self.args.seed)
+        new_generated_latents = torch.randn(
+            edited_latents.shape,
+            dtype=edited_latents.dtype,
+            device=edited_latents.device,
+            generator=generator
+        )
+              
+        ## Changed
+        alpha = self.args.attention_alpha
+        combined_latents = alpha * edited_latents + (1 - alpha) * new_generated_latents
+
+        ## Changed
         images = self.pipe(
             prompts,
             height=1024,
@@ -108,7 +130,7 @@ class StableFlow:
             output_type="pil",
             num_inference_steps=50,
             max_sequence_length=512,
-            latents=inverted_latent_list[-1].tile(len(prompts), 1, 1),
+            latents=combined_latents,
             inverted_latent_list=inverted_latent_list,
             mm_copy_blocks=StableFlow.MULTIMODAL_VITAL_LAYERS,
             single_copy_blocks=StableFlow.SINGLE_MODAL_VITAL_LAYERS,

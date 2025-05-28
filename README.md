@@ -14,6 +14,10 @@ python run_stable_flow.py \
   --cpu_offload \
   --seed 42
 
+## Style Editing (Portrait -> Pencil Sketch)
+![tasK_1](https://github.com/user-attachments/assets/fab7d81e-6c82-4ff3-a8d9-3462b3bb0e62)
 
-![tasK_1](https://github.com/user-attachments/assets/db78940d-4b25-4f32-b4e5-f8088403ea24)
 
+
+## Time-of-Day Transition (Daytime City Street -> Night)
+![task_2](https://github.com/user-attachments/assets/a1cd14d3-759f-4783-af0b-a59f3c6de958)
